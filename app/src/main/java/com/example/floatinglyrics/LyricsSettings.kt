@@ -15,7 +15,9 @@ internal data class LyricsSettings(
     val popupTextSize: Int = 16,
     val popupDarkness: Int = 75,
     val popupOffsetX: Int = 0,
-    val popupOffsetY: Int = 0
+    val popupOffsetY: Int = 0,
+    val useLyricsButton: Boolean = false,
+    val seekOnLyricTap: Boolean = true
 ) {
     fun save(preferences: SharedPreferences) {
         preferences.edit()
@@ -31,6 +33,8 @@ internal data class LyricsSettings(
             .putInt("popupDarkness", popupDarkness)
             .putInt("popupOffsetX", popupOffsetX)
             .putInt("popupOffsetY", popupOffsetY)
+            .putBoolean("useLyricsButton", useLyricsButton)
+            .putBoolean("seekOnLyricTap", seekOnLyricTap)
             .apply()
     }
 
@@ -50,7 +54,9 @@ internal data class LyricsSettings(
             popupTextSize = preferences.getInt("popupTextSize", 16),
             popupDarkness = preferences.getInt("popupDarkness", 75),
             popupOffsetX = preferences.getInt("popupOffsetX", 0),
-            popupOffsetY = preferences.getInt("popupOffsetY", 0)
+            popupOffsetY = preferences.getInt("popupOffsetY", 0),
+            useLyricsButton = preferences.getBoolean("useLyricsButton", false),
+            seekOnLyricTap = preferences.getBoolean("seekOnLyricTap", true)
         )
     }
 }

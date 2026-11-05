@@ -2,8 +2,6 @@ package com.example.floatinglyrics
 
 import android.net.Uri
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -27,7 +25,7 @@ internal object YouTubeMusicLyrics {
         return candidate?.takeIf(idPattern::matches)
     }
 
-    fun find(song: Song): Lyrics? {
+    suspend fun find(song: Song): Lyrics? {
         val id = song.videoId ?: return null
         val next = request("next", JSONObject().put("videoId", id).put("isAudioOnly", true), web)
         val browseId = findValue(next, "browseId") { it is String && it.startsWith("MPLY") } as? String
@@ -91,29 +89,16 @@ internal object YouTubeMusicLyrics {
         return null
     }
 
-    private fun request(endpoint: String, body: JSONObject, client: Client): JSONObject {
-        val connection = URL("https://www.youtube.com/youtubei/v1/$endpoint?prettyPrint=false")
-            .openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 4500
-            connection.readTimeout = 5000
-            connection.instanceFollowRedirects = false
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.setRequestProperty("X-Youtube-Client-Name", client.id.toString())
-            connection.setRequestProperty("X-Youtube-Client-Version", client.version)
-            val context = JSONObject().put("client", JSONObject()
-                .put("clientName", client.name).put("clientVersion", client.version)
-                .put("hl", "ko").put("gl", "KR"))
-            body.put("context", context)
-            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            val status = connection.responseCode
-            if (status !in 200..299) throw IOException("YouTube Music HTTP $status")
-            return connection.inputStream.bufferedReader(Charsets.UTF_8).use { JSONObject(it.readText()) }
-        } finally {
-            connection.disconnect()
-        }
+    private suspend fun request(endpoint: String, body: JSONObject, client: Client): JSONObject {
+        val context = JSONObject().put("client", JSONObject()
+            .put("clientName", client.name).put("clientVersion", client.version)
+            .put("hl", "ko").put("gl", "KR"))
+        body.put("context", context)
+        return JSONObject(LyricsHttp.request(
+            "https://www.youtube.com/youtubei/v1/$endpoint?prettyPrint=false", body.toString(),
+            mapOf("X-Youtube-Client-Name" to client.id.toString(),
+                "X-Youtube-Client-Version" to client.version)
+        ))
     }
 
     private data class Client(val name: String, val id: Int, val version: String)

@@ -2,12 +2,19 @@ package com.example.floatinglyrics
 
 import android.accessibilityservice.AccessibilityService
 import android.app.KeyguardManager
+import android.view.ViewConfiguration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.content.SharedPreferences
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
+import androidx.core.view.doOnLayout
 import android.text.TextUtils
 import android.text.Spannable
 import android.text.SpannableStringBuilder
@@ -29,6 +36,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -39,7 +48,6 @@ import org.json.JSONException
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import android.widget.ImageButton
 import android.widget.FrameLayout
@@ -47,9 +55,10 @@ import android.view.View
 import android.widget.Toast
 import androidx.compose.runtime.mutableStateOf
 
+internal class LyricsLookupException(message: String) : IOException(message)
+
 class LyricsOverlayService : AccessibilityService() {
     companion object {
-        private val TIME_LABEL = Regex("""-?\d{1,2}(?::\d{2}){1,2}""")
         val lyricsWarning = mutableStateOf("")
         val translationWarning = mutableStateOf("")
         val translationStatus = mutableStateOf("")
@@ -58,11 +67,22 @@ class LyricsOverlayService : AccessibilityService() {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val cache = android.util.LruCache<Song, Lyrics>(32)
+    private val cache = object : android.util.LruCache<String, Lyrics>(512 * 1024) {
+        override fun sizeOf(key: String, value: Lyrics): Int =
+            (value.plain.length * 2 + value.lines.sumOf { it.text.length * 2 + 32 }).coerceAtLeast(1)
+    }
+    private val diskCache by lazy { LyricsDiskCache(this) }
+    private val missingLyrics = android.util.LruCache<String, Long>(32)
+    private val playbackObserver: PlaybackObserver by lazy {
+        PlaybackObserver(this) { updateLyrics() }
+    }
     private var lookup: Job? = null
     private var translationJob: Job? = null
     private val translations = mutableMapOf<String, String>()
-    private val translatedSongs = android.util.LruCache<Song, Map<String, String>>(32)
+    private val translatedSongs = object : android.util.LruCache<String, Map<String, String>>(512 * 1024) {
+        override fun sizeOf(key: String, value: Map<String, String>): Int =
+            value.entries.sumOf { (it.key.length + it.value.length) * 2 + 32 }.coerceAtLeast(1)
+    }
     private var song: Song? = null
     private var lyrics: Lyrics? = null
     private var status = ""
@@ -73,7 +93,6 @@ class LyricsOverlayService : AccessibilityService() {
         override fun run() {
             if (overlay == null) return
             updateLyrics()
-            if (overlay != null) handler.postDelayed(this, 250)
         }
     }
     private val recentChecks = ArrayDeque<String>()
@@ -81,8 +100,8 @@ class LyricsOverlayService : AccessibilityService() {
     private val windowManager by lazy { getSystemService(WindowManager::class.java) }
     private var overlay: ScrollView? = null
     private var coverWindow: FrameLayout? = null
-    private var refreshButton: ImageButton? = null
-    private var moveButton: ImageButton? = null
+    private var lyricsButton: ImageButton? = null
+    private var pendingTapOffset: Int? = null
     private var popupButton: ImageButton? = null
     private var popupMode = false
     private var overlayLabel: TextView? = null
@@ -106,6 +125,7 @@ class LyricsOverlayService : AccessibilityService() {
             applyOverlayMode()
             updateCoverBackground()
             refreshOverlay()
+            updateLyrics()
         }
     }
     private var lyricsVisible = false
@@ -122,22 +142,39 @@ class LyricsOverlayService : AccessibilityService() {
     private val activeWeight = StyleSpan(Typeface.BOLD)
     private val refresh = Runnable { refreshOverlay() }
     private val youtubeMusic = "com.google.android.apps.youtube.music"
+    private var screenReceiverRegistered = false
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) hideOverlay() else refreshOverlay()
+        }
+    }
 
     override fun onServiceConnected() {
         settings = LyricsSettings.read(lyricsPreferences)
         lyricsPreferences.registerOnSharedPreferenceChangeListener(settingsListener)
+        if (!screenReceiverRegistered) {
+            ContextCompat.registerReceiver(this, screenReceiver, IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            }, ContextCompat.RECEIVER_NOT_EXPORTED)
+            screenReceiverRegistered = true
+        }
         refreshOverlay()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
-            event.packageName?.toString() != youtubeMusic
+        val fromYouTubeMusic = event.packageName?.toString() == youtubeMusic
+        if ((event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) && !fromYouTubeMusic
         ) return
 
-        handler.removeCallbacks(refresh)
-        refreshOverlay()
-        // The window hierarchy may settle after the transition event.
-        handler.postDelayed(refresh, 200)
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        ) {
+            refreshOverlay()
+        } else if (!handler.hasCallbacks(refresh)) {
+            handler.postDelayed(refresh, 180)
+        }
     }
 
     override fun onInterrupt() {
@@ -147,72 +184,68 @@ class LyricsOverlayService : AccessibilityService() {
 
     override fun onDestroy() {
         onInterrupt()
+        if (screenReceiverRegistered) {
+            unregisterReceiver(screenReceiver)
+            screenReceiverRegistered = false
+        }
         lyricsPreferences.unregisterOnSharedPreferenceChangeListener(settingsListener)
         scope.cancel()
         super.onDestroy()
     }
 
     private fun refreshOverlay() {
+        handler.removeCallbacks(refresh)
+        refreshPlayerSurface()
+    }
+
+    private fun refreshPlayerSurface() {
         if (!settings.enabled) {
             hideOverlay()
             return
         }
+        if (!getSystemService(PowerManager::class.java).isInteractive ||
+            getSystemService(KeyguardManager::class.java).isKeyguardLocked
+        ) {
+            hideOverlay()
+            return
+        }
+        // An explicitly opened popup can continue outside the player. Its two
+        // player buttons are hidden by syncLyricsButton().
         if (popupMode) {
             updateLyrics()
             return
         }
-        val root = rootInActiveWindow ?: windows.firstOrNull { it.isActive }?.root
-        if (root?.packageName?.toString() == youtubeMusic &&
-            getSystemService(PowerManager::class.java).isInteractive &&
-            !getSystemService(KeyguardManager::class.java).isKeyguardLocked &&
-            isExpandedPlayer(root)
-        ) {
-            val bounds = findCover(root)
-            if (bounds != null) {
-                showOverlay(bounds)
-            } else {
-                recordCheck("전체 플레이어에서 앨범 커버 위치를 찾지 못했어요.")
-                hideOverlay()
-            }
-        } else {
-            hideOverlay()
+        val root = windows.firstOrNull {
+            it.isActive && it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        }?.root ?: rootInActiveWindow
+        val player = root?.takeIf { it.packageName?.toString() == youtubeMusic }
+            ?.let(PlayerLayoutDetector::inspect)
+        if (player?.expanded != true) {
+            recordCheck("전체 재생화면 아님 · 가사창과 버튼 숨김")
+            // Hide immediately on Home, Search, Library, mini-player or another
+            // app. Keep the user's open/closed choice for returning to the player.
+            hideOverlay(preserveOpenState = true)
+            return
         }
+        recordCheck(if (player.playlistVisible) "재생목록 · 고정 가사창 위쪽 절반 사용"
+            else "전체 재생화면 · 저장한 고정 위치 사용")
+        showOverlay(fixedPlayerBounds(player.playlistVisible))
     }
 
-    private fun isExpandedPlayer(root: AccessibilityNodeInfo): Boolean {
-        var hasTimeline = false
-        var hasTransport = false
-        var timeLabels = 0
-        val ids = sortedSetOf<String>()
-        val nodes = ArrayDeque<AccessibilityNodeInfo>()
-        nodes.add(root)
-        while (nodes.isNotEmpty()) {
-            val node = nodes.removeFirst()
-            if (node.isVisibleToUser) {
-                val id = node.viewIdResourceName.orEmpty().substringAfterLast('/')
-                if (id.isNotEmpty()) ids.add(id)
-                val description = node.contentDescription?.toString().orEmpty()
-                hasTimeline = hasTimeline ||
-                    node.className?.toString() == "android.widget.SeekBar" ||
-                    id.contains("seek_bar") || id.contains("seekbar")
-                hasTransport = hasTransport ||
-                    id.contains("previous") || id.contains("next_button") ||
-                    id.contains("next_track") ||
-                    description.contains("이전 곡") || description.contains("다음 곡") ||
-                    description.contains("previous track", ignoreCase = true) ||
-                    description.contains("next track", ignoreCase = true)
-                if (TIME_LABEL.matches(node.text?.toString()?.trim().orEmpty())) timeLabels++
-            }
-            for (index in 0 until node.childCount) {
-                node.getChild(index)?.let(nodes::addLast)
-            }
-        }
-        val expanded = (hasTimeline && (hasTransport || timeLabels >= 2)) ||
-            (hasTransport && timeLabels >= 2)
-        recordCheck("전체 플레이어: ${if (expanded) "감지" else "미감지"} · " +
-            "재생 막대: $hasTimeline · 이전/다음: $hasTransport · 시간 표시: $timeLabels" +
-            "\n화면 요소: ${ids.joinToString().ifEmpty { "없음" }}")
-        return expanded
+    private fun fixedPlayerBounds(playlistVisible: Boolean = false): Rect {
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.density
+        val inset = (20 * density).toInt().coerceAtMost(width / 4)
+        val top = (120 * density).toInt().coerceAtMost(height / 4)
+        val bottomInset = (32 * density).toInt()
+        val side = minOf(width - inset * 2, height - top - bottomInset).coerceAtLeast(1)
+        val left = (width - side) / 2
+        // The screen dimensions are the only geometry input. User offsets are
+        // applied by coverLayout(); player artwork and sheet positions never are.
+        val panelHeight = if (playlistVisible) (side / 2).coerceAtLeast(1) else side
+        return Rect(left, top, left + side, top + panelHeight)
     }
 
     private fun recordCheck(message: String) {
@@ -222,61 +255,15 @@ class LyricsOverlayService : AccessibilityService() {
         lastCheck.value = recentChecks.reversed().joinToString("\n\n")
     }
 
-    private fun findCover(root: AccessibilityNodeInfo): Rect? {
-        val screen = Rect()
-        root.getBoundsInScreen(screen)
-        val minimum = screen.width() * 0.55f
-        val density = resources.displayMetrics.density
-        var best: Rect? = null
-        var bestNamed = false
-        var titleTop = screen.bottom
-        val nodes = ArrayDeque<AccessibilityNodeInfo>()
-        nodes.add(root)
-        while (nodes.isNotEmpty()) {
-            val node = nodes.removeFirst()
-            if (node.isVisibleToUser) {
-                val id = node.viewIdResourceName.orEmpty().substringAfterLast('/')
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                if ((id == "song_title" || id == "track_title" || id == "player_title" ||
-                        id == "title") && bounds.top > screen.top + minimum
-                ) titleTop = minOf(titleTop, bounds.top)
-
-                val named = listOf("artwork", "album_art", "thumbnail", "cover").any(id::contains)
-                val image = node.className?.toString() == "android.widget.ImageView"
-                val ratio = bounds.width().toFloat() / bounds.height()
-                if ((named || image) && bounds.width() >= minimum && ratio in 0.8f..1.25f &&
-                    screen.contains(bounds) && bounds.centerY() < screen.centerY() &&
-                    (best == null || (named && !bestNamed) ||
-                        (named == bestNamed && bounds.width() > best.width()))
-                ) {
-                    best = bounds
-                    bestNamed = named
-                }
-            }
-            for (index in 0 until node.childCount) {
-                node.getChild(index)?.let(nodes::addLast)
-            }
-        }
-        if (best != null) return best
-        // Some player layouts omit the image from the accessibility tree.
-        if (titleTop == screen.bottom) return null
-        val inset = (20 * density).toInt()
-        val bottom = titleTop - (24 * density).toInt()
-        val side = minOf(screen.width() - inset * 2, bottom - screen.top - inset * 2)
-        if (side < minimum) return null
-        return Rect(screen.centerX() - side / 2, bottom - side,
-            screen.centerX() - side / 2 + side, bottom)
-    }
-
     private fun showOverlay(bounds: Rect) {
         val existing = coverWindow
         if (existing != null) {
             if (coverBounds != bounds) {
-                windowManager.updateViewLayout(existing, coverLayout(bounds))
                 coverBounds = Rect(bounds)
+                windowManager.updateViewLayout(existing, coverLayout(bounds))
                 followedLine = -1
             }
+            syncLyricsButton()
             return
         }
 
@@ -291,12 +278,15 @@ class LyricsOverlayService : AccessibilityService() {
                     leavePopup()
                     return@setOnClickListener
                 }
-                lyricsVisible = !lyricsVisible
-                updateCoverBackground()
-                updateLyrics()
+                if (!lyricsVisible || (!settings.seekOnLyricTap && !settings.useLyricsButton)) {
+                    setLyricsVisible(!lyricsVisible)
+                } else if (settings.seekOnLyricTap) {
+                    seekTappedLyric()
+                }
             }
         }
-        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        val touchSlop = ViewConfiguration.get(this).scaledTouchSlop
+        label.setOnTouchListener(lyricTapListener(touchSlop))
         val cover = object : ScrollView(this) {
             override fun dispatchTouchEvent(event: MotionEvent): Boolean {
                 when (event.actionMasked) {
@@ -310,7 +300,10 @@ class LyricsOverlayService : AccessibilityService() {
                             if (settings.autoScroll) followedLine = -1
                         }
                     }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> touchStarted = false
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        touchStarted = false
+                        scheduleLyricsUpdate()
+                    }
                 }
                 return super.dispatchTouchEvent(event)
             }
@@ -319,6 +312,7 @@ class LyricsOverlayService : AccessibilityService() {
                 if (bottom - top != oldBottom - oldTop) {
                     updateLyricsPadding()
                     followedLine = -1
+                    overlayLabel?.doOnLayout { updateLyrics() }
                 }
             }
             isFillViewport = true
@@ -328,45 +322,6 @@ class LyricsOverlayService : AccessibilityService() {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.WRAP_CONTENT
             ))
-        }
-        val density = resources.displayMetrics.density
-        val buttonSize = (44 * density).toInt()
-        val iconPadding = (12 * density).toInt()
-        val margin = (4 * density).toInt()
-        fun control(icon: Int, description: String) = ImageButton(this).apply {
-            setImageResource(icon)
-            setColorFilter(Color.WHITE)
-            setPadding(iconPadding, iconPadding, iconPadding, iconPadding)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0x66000000)
-            }
-            contentDescription = description
-            visibility = View.GONE
-        }
-        val retry = control(R.drawable.ic_lyrics_refresh, "가사 새로고침").apply {
-            setOnClickListener {
-                val current = song
-                if (lyricsVisible && current != null && lookup?.isActive != true) {
-                    cache.remove(current)
-                    translatedSongs.remove(current)
-                    startLookup(current)
-                    updateLyrics()
-                }
-            }
-        }
-        val move = control(R.drawable.ic_lyrics_move, "가사창 위치 조정").apply {
-            setOnClickListener {
-                Toast.makeText(this@LyricsOverlayService, "이 버튼을 끌어서 가사창을 옮기세요.", Toast.LENGTH_SHORT).show()
-            }
-            setOnTouchListener(coverDragListener(touchSlop))
-        }
-        val popup = control(R.drawable.ic_lyrics_popup, "작은 가사 팝업으로 전환").apply {
-            setOnClickListener {
-                popupMode = true
-                applyOverlayMode()
-                updateLyrics()
-            }
         }
         val popupDrag = popupDragListener(touchSlop)
         val window = object : FrameLayout(this) {
@@ -383,30 +338,19 @@ class LyricsOverlayService : AccessibilityService() {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT
             ))
-            addView(retry, FrameLayout.LayoutParams(buttonSize, buttonSize, Gravity.TOP or Gravity.END).apply {
-                marginEnd = margin
-                topMargin = margin
-            })
-            addView(move, FrameLayout.LayoutParams(buttonSize, buttonSize, Gravity.TOP or Gravity.END).apply {
-                marginEnd = margin
-                topMargin = buttonSize + margin * 2
-            })
-            addView(popup, FrameLayout.LayoutParams(buttonSize, buttonSize, Gravity.BOTTOM or Gravity.END).apply {
-                marginEnd = margin
-                bottomMargin = margin
-            })
+
         }
         try {
             windowManager.addView(window, coverLayout(bounds))
             coverWindow = window
-            refreshButton = retry
-            moveButton = move
-            popupButton = popup
+            updateCoverBackground()
             overlay = cover
             overlayLabel = label
             coverBounds = Rect(bounds)
+            applyCoverVisibility()
+            syncLyricsButton()
+            if (lyricsVisible) playbackObserver.start()
             updateLyrics()
-            handler.post(tick)
         } catch (error: WindowManager.BadTokenException) {
             recordCheck("가사창 열기 실패: ${error.javaClass.simpleName}")
             android.util.Log.w("LyricsOverlay", "Overlay window unavailable", error)
@@ -428,50 +372,7 @@ class LyricsOverlayService : AccessibilityService() {
         x = (bounds.left + (offsetX * metrics.density).toInt())
             .coerceIn(0, (metrics.widthPixels - bounds.width()).coerceAtLeast(0))
         y = (bounds.top + 2 + (offsetY * metrics.density).toInt())
-            .coerceIn(0, (metrics.heightPixels - bounds.height()).coerceAtLeast(0))
-    }
-
-    private fun coverDragListener(touchSlop: Int): View.OnTouchListener {
-        var startX = 0f
-        var startY = 0f
-        var offsetX = 0
-        var offsetY = 0
-        var moved = false
-        return View.OnTouchListener { view, event ->
-            val bounds = coverBounds ?: return@OnTouchListener false
-            val window = coverWindow ?: return@OnTouchListener false
-            val density = resources.displayMetrics.density
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    startX = event.rawX
-                    startY = event.rawY
-                    offsetX = settings.coverOffsetX
-                    offsetY = settings.coverOffsetY
-                    moved = false
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - startX
-                    val dy = event.rawY - startY
-                    if (moved || kotlin.math.abs(dx) > touchSlop || kotlin.math.abs(dy) > touchSlop) {
-                        moved = true
-                        val position = coverLayout(bounds, offsetX + (dx / density).toInt(),
-                            offsetY + (dy / density).toInt())
-                        windowManager.updateViewLayout(window, position)
-                    }
-                }
-                MotionEvent.ACTION_UP -> {
-                    if (moved) {
-                        val position = window.layoutParams as WindowManager.LayoutParams
-                        settings.copy(
-                            coverOffsetX = ((position.x - bounds.left) / density).toInt(),
-                            coverOffsetY = ((position.y - bounds.top - 2) / density).toInt()
-                        ).save(lyricsPreferences)
-                    } else view.performClick()
-                }
-                MotionEvent.ACTION_CANCEL -> windowManager.updateViewLayout(window, coverLayout(bounds))
-            }
-            true
-        }
+            .coerceIn(0, (metrics.heightPixels - fixedPlayerBounds().height()).coerceAtLeast(0))
     }
 
     private fun popupDragListener(touchSlop: Int): View.OnTouchListener {
@@ -551,6 +452,8 @@ class LyricsOverlayService : AccessibilityService() {
         label.maxLines = if (popupMode) settings.popupLines else Int.MAX_VALUE
         label.ellipsize = if (popupMode) TextUtils.TruncateAt.END else null
         cover.isVerticalScrollBarEnabled = !popupMode
+        applyCoverVisibility()
+        syncLyricsButton()
         displayedLyrics = null
         displayedSong = null
         updateCoverBackground()
@@ -563,7 +466,226 @@ class LyricsOverlayService : AccessibilityService() {
         updateLyrics()
     }
 
+
+    private fun setLyricsVisible(visible: Boolean) {
+        lyricsVisible = visible
+        pendingTapOffset = null
+        if (visible) followedLine = -1
+        applyCoverVisibility()
+        updateCoverBackground()
+        syncLyricsButton()
+        if (visible) {
+            playbackObserver.start()
+            val current = song
+            val loaded = lyrics
+            if (current != null && loaded != null && translationJob?.isActive != true && translations.isEmpty()) {
+                resetTranslation()
+                startTranslation(current, loaded)
+            }
+        } else {
+            playbackObserver.stop()
+            lookup?.cancel()
+            translationJob?.cancel()
+            if (lyrics == null) song = null
+        }
+        updateLyrics()
+    }
+
+    private fun applyCoverVisibility() {
+        coverWindow?.visibility = if (lyricsVisible || !settings.useLyricsButton || popupMode)
+            View.VISIBLE else View.GONE
+    }
+
+    private fun syncLyricsButton(position: WindowManager.LayoutParams? = null) {
+        if (popupMode || (!settings.useLyricsButton && !lyricsVisible)) {
+            lyricsButton?.visibility = View.GONE
+            popupButton?.visibility = View.GONE
+            return
+        }
+        val window = coverWindow ?: return
+        val frame = position ?: window.layoutParams as WindowManager.LayoutParams
+        val density = resources.displayMetrics.density
+        val width = (60 * density).toInt()
+        val height = (44 * density).toInt()
+        val inset = (4 * density).toInt()
+        val params = WindowManager.LayoutParams(
+            width, height, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.LEFT
+            x = (frame.x + frame.width - width - inset).coerceAtLeast(0)
+            y = (frame.y + frame.height - height - inset).coerceAtLeast(0)
+        }
+        val existing = lyricsButton
+        if (existing == null) {
+            val button = ImageButton(this).apply {
+                setColorFilter(Color.WHITE)
+                val padding = (12 * density).toInt()
+                setPadding(padding, padding, padding, padding)
+                background = GradientDrawable().apply {
+                    cornerRadius = 22 * density
+                    setColor(0xE6282828.toInt())
+                }
+                isClickable = true
+                isFocusable = false
+                setOnClickListener { setLyricsVisible(!lyricsVisible) }
+            }
+            try {
+                windowManager.addView(button, params)
+                lyricsButton = button
+            } catch (error: WindowManager.BadTokenException) {
+                android.util.Log.w("LyricsOverlay", "Lyrics button unavailable", error)
+                return
+            }
+        } else {
+            val previous = existing.layoutParams as WindowManager.LayoutParams
+            if (previous.x != params.x || previous.y != params.y) {
+                windowManager.updateViewLayout(existing, params)
+            }
+            existing.visibility = View.VISIBLE
+        }
+        lyricsButton?.apply {
+            setImageResource(if (lyricsVisible) R.drawable.ic_lyrics_close else R.drawable.ic_lyrics_open)
+            contentDescription = if (lyricsVisible) "Eom 가사 닫기" else "Eom 가사 열기"
+        }
+        if (popupButton == null) {
+            val button = ImageButton(this).apply {
+                setImageResource(R.drawable.ic_lyrics_popup)
+                setColorFilter(Color.WHITE)
+                val padding = (12 * density).toInt()
+                setPadding(padding, padding, padding, padding)
+                background = GradientDrawable().apply {
+                    cornerRadius = 22 * density
+                    setColor(0xE6282828.toInt())
+                }
+                contentDescription = "작은 가사 팝업으로 전환"
+                setOnClickListener {
+                    popupMode = true
+                    applyOverlayMode()
+                    updateLyrics()
+                }
+            }
+            try {
+                windowManager.addView(button, WindowManager.LayoutParams().apply {
+                    copyFrom(params)
+                    y = (params.y - height - inset).coerceAtLeast(0)
+                })
+                popupButton = button
+            } catch (error: WindowManager.BadTokenException) {
+                android.util.Log.w("LyricsOverlay", "Popup button unavailable", error)
+            }
+        } else {
+            val above = WindowManager.LayoutParams().apply {
+                copyFrom(params)
+                y = (params.y - height - inset).coerceAtLeast(0)
+            }
+            val previous = popupButton!!.layoutParams as WindowManager.LayoutParams
+            if (previous.x != above.x || previous.y != above.y) {
+                windowManager.updateViewLayout(popupButton, above)
+            }
+        }
+        popupButton?.visibility = if (lyricsVisible) View.VISIBLE else View.GONE
+    }
+
+    private fun lyricTapListener(touchSlop: Int): View.OnTouchListener {
+        var downX = 0f
+        var downY = 0f
+        var downTime = 0L
+        var moved = false
+        return View.OnTouchListener { view, event ->
+            if (popupMode) return@OnTouchListener false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    downTime = event.eventTime
+                    moved = false
+                    pendingTapOffset = null
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (kotlin.math.abs(event.x - downX) > touchSlop ||
+                        kotlin.math.abs(event.y - downY) > touchSlop) moved = true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved && event.eventTime - downTime < ViewConfiguration.getLongPressTimeout()) {
+                        val label = view as TextView
+                        pendingTapOffset = lyricOffset(label, event.x, event.y)
+                        view.performClick()
+                        pendingTapOffset = null
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    moved = true
+                    pendingTapOffset = null
+                }
+            }
+            true
+        }
+    }
+
+    private fun lyricOffset(label: TextView, x: Float, y: Float): Int? {
+        val layout = label.layout ?: return null
+        val localX = x - label.totalPaddingLeft + label.scrollX
+        val localY = y - label.totalPaddingTop + label.scrollY
+        if (localY < 0 || localY >= layout.height) return null
+        val row = layout.getLineForVertical(localY.toInt())
+        if (localX < layout.getLineLeft(row) || localX > layout.getLineRight(row)) return null
+        return layout.getOffsetForHorizontal(row, localX)
+    }
+
+    private fun seekTappedLyric() {
+        val offset = pendingTapOffset ?: return
+        val loaded = lyrics ?: return
+        val displayed = displayedSong ?: return
+        if (displayedLyrics !== loaded || loaded.lines.isEmpty()) {
+            Toast.makeText(this, "시간 정보가 있는 가사에서 이동할 수 있어요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val lineIndex = LyricsInteraction.lineAt(offset, lineRanges) ?: return
+        val target = loaded.lines.getOrNull(lineIndex)?.timeMs ?: return
+        val manager = getSystemService(MediaSessionManager::class.java)
+        val session = try {
+            manager.getActiveSessions(ComponentName(this, PlaybackNotificationListener::class.java))
+                .firstOrNull { it.packageName == youtubeMusic }
+        } catch (_: SecurityException) { null } ?: return
+        val metadata = session.metadata ?: return
+        val title = metadata.description?.title?.toString().orEmpty()
+        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: metadata.description?.subtitle?.toString().orEmpty()
+        val mediaId = sequenceOf(
+            metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
+            metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_URI),
+            session.extras?.getString("videoId")
+        ).firstNotNullOfOrNull(YouTubeMusicLyrics::videoId)
+        val current = Song(title, artist, metadata.getLong(MediaMetadata.METADATA_KEY_DURATION), mediaId)
+        if (!SongMatcher.sameRecording(current, displayed) || !SongMatcher.sameRecording(current, song)) {
+            updateLyrics()
+            return
+        }
+        val state = session.playbackState
+        if (state == null || state.actions and PlaybackState.ACTION_SEEK_TO == 0L) {
+            Toast.makeText(this, "현재 재생에서는 구간 이동을 지원하지 않아요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val duration = current.durationMs.takeIf { it > 0 } ?: Long.MAX_VALUE
+        try {
+            session.transportControls.seekTo(target.coerceIn(0, duration))
+            manualScrollUntil = 0
+            followedLine = -1
+            handler.removeCallbacks(refresh)
+            handler.postDelayed(refresh, 120)
+        } catch (_: SecurityException) {
+            Toast.makeText(this, "재생 위치를 옮길 수 없어요. 알림 접근 권한을 확인해 주세요.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun updateLyrics() {
+        renderLyrics()
+        scheduleLyricsUpdate()
+    }
+
+    private fun renderLyrics() {
         val label = overlayLabel ?: return
         if (!getSystemService(PowerManager::class.java).isInteractive ||
             getSystemService(KeyguardManager::class.java).isKeyguardLocked
@@ -572,58 +694,27 @@ class LyricsOverlayService : AccessibilityService() {
             return
         }
 
-        val controls = if (lyricsVisible && !popupMode) View.VISIBLE else View.GONE
-        refreshButton?.visibility = controls
-        moveButton?.visibility = controls
-        popupButton?.visibility = controls
         if (!lyricsVisible) {
             showMessage("")
             return
         }
-        val manager = getSystemService(MediaSessionManager::class.java)
-        val listener = ComponentName(this, PlaybackNotificationListener::class.java)
-        val session = try {
-            manager.getActiveSessions(listener).firstOrNull { it.packageName == youtubeMusic }
-        } catch (_: SecurityException) {
+        if (!playbackObserver.hasAccess) {
             clearSong("Floating Lyrics의 알림 접근을 허용해 주세요.")
             return
         }
-        val metadata = session?.metadata
-        val title = metadata?.description?.title?.toString().orEmpty()
-        val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)
-            ?: metadata?.description?.subtitle?.toString().orEmpty()
-        if (title.isBlank() || artist.isBlank()) {
+        val current = playbackObserver.song
+        if (current == null) {
             clearSong("현재 곡 정보를 기다리는 중…")
             return
         }
-        val videoId = sequenceOf(
-            metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
-            metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_URI),
-            session?.extras?.getString("videoId")
-        ).firstNotNullOfOrNull(YouTubeMusicLyrics::videoId)
-        val current = Song(title, artist, metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0, videoId)
-        if (song != current) startLookup(current)
+        if (!SongMatcher.sameRecording(song, current)) startLookup(current)
         val loaded = lyrics
-        refreshButton?.apply {
-            isEnabled = lookup?.isActive != true
-            alpha = if (isEnabled) 1f else 0.45f
-        }
         if (loaded == null) {
             showMessage(lyricsWarning.value.ifBlank { status }, warning = lyricsWarning.value.isNotBlank())
             return
         }
-        val state = session?.playbackState
-        val position = state?.position
-        val activeLine = if (position == null || position < 0 || loaded.lines.isEmpty()) {
-            -1
-        } else {
-            val elapsed = if (state.state == PlaybackState.STATE_PLAYING && state.lastPositionUpdateTime > 0) {
-                ((SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0) *
-                    state.playbackSpeed).toLong()
-            } else 0L
-            val index = loaded.lines.binarySearchBy(position + elapsed) { it.timeMs }
-            if (index >= 0) index else -index - 2
-        }
+        val position = playbackPosition()
+        val activeLine = if (position == null) -1 else LyricsTiming.indexAt(loaded.lines, position)
         if (popupMode) {
             showMessage(popupText(loaded, activeLine))
         } else {
@@ -643,6 +734,43 @@ class LyricsOverlayService : AccessibilityService() {
             translationWarningShown = true
             Toast.makeText(this, warning, Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun playbackPosition(): Long? {
+        val state = playbackObserver.state ?: return null
+        if (state.position < 0) return null
+        val speed = state.playbackSpeed
+        val elapsed = if (state.state == PlaybackState.STATE_PLAYING &&
+            state.lastPositionUpdateTime > 0 && speed.isFinite()
+        ) ((SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0) * speed).toLong()
+            else 0L
+        val duration = playbackObserver.song?.durationMs?.takeIf { it > 0 } ?: Long.MAX_VALUE
+        return (state.position + elapsed).coerceIn(0, duration)
+    }
+
+    private fun scheduleLyricsUpdate() {
+        handler.removeCallbacks(tick)
+        if (overlay == null || !lyricsVisible) return
+        val now = SystemClock.elapsedRealtime()
+        var nextUpdate = Long.MAX_VALUE
+        val state = playbackObserver.state
+        val position = playbackPosition()
+        val lines = lyrics?.lines
+        if (state?.state == PlaybackState.STATE_PLAYING && position != null &&
+            state.playbackSpeed.isFinite() && state.playbackSpeed > 0 && !lines.isNullOrEmpty()
+        ) {
+            val nextLine = lines.getOrNull(LyricsTiming.indexAt(lines, position) + 1)
+            if (nextLine != null) {
+                val wait = kotlin.math.ceil((nextLine.timeMs - position) / state.playbackSpeed.toDouble())
+                    .toLong().coerceIn(16L, 86_400_000L)
+                nextUpdate = now + wait
+            }
+        }
+        if (settings.autoScroll && !popupMode && !touchStarted && manualScrollUntil > now) {
+            nextUpdate = minOf(nextUpdate, manualScrollUntil)
+        }
+        if (translationRetryAt > now) nextUpdate = minOf(nextUpdate, translationRetryAt)
+        if (nextUpdate != Long.MAX_VALUE) handler.postDelayed(tick, (nextUpdate - now).coerceAtLeast(16))
     }
 
     private fun popupText(loaded: Lyrics, activeLine: Int): String {
@@ -684,6 +812,7 @@ class LyricsOverlayService : AccessibilityService() {
             manualScrollUntil = 0
             overlay?.scrollTo(0, 0)
         }
+        label.doOnLayout { updateLyrics() }
     }
 
     private fun updateCoverBackground() {
@@ -749,58 +878,95 @@ class LyricsOverlayService : AccessibilityService() {
         song = null
         lyrics = null
         fullLyrics.value = ""
-        refreshButton?.apply {
-            isEnabled = false
-            alpha = 0.45f
-        }
         showMessage(message)
     }
 
-    private fun startLookup(current: Song) {
+    private fun startLookup(current: Song, force: Boolean = false) {
+        lookup?.cancel()
         resetTranslation()
         lyricsWarning.value = ""
-        lookup?.cancel()
         song = current
-        lyrics = cache.get(current)
-        fullLyrics.value = lyrics?.let { "${current.title} · ${current.artist}\n\n${it.plain}" }.orEmpty()
-        lyrics?.let {
-            startTranslation(current, it)
-            return
+        lyrics = null
+        fullLyrics.value = ""
+        val key = SongMatcher.recordingKey(current)
+        if (force) {
+            cache.remove(key)
+            missingLyrics.remove(key)
+            translatedSongs.remove(key)
+        } else {
+            cache.get(key)?.let {
+                acceptLyrics(current, it)
+                return
+            }
         }
         status = "가사 찾는 중…"
         lookup = scope.launch {
-            val result = try {
-                searchSources(current)
-            } catch (_: IOException) {
+            try {
+                if (force) diskCache.remove(current)
+                else diskCache.read(current)?.let {
+                    acceptLyrics(current, it)
+                    return@launch
+                }
+                if (!force && (missingLyrics.get(key) ?: 0) > SystemClock.elapsedRealtime()) {
+                    lyricsWarning.value = "이 곡과 일치하는 가사를 찾지 못했어요. 새로고침으로 다시 검색할 수 있어요."
+                    return@launch
+                }
+                val result = searchSources(current) { preview -> acceptLyrics(current, preview) }
+                if (result == null) {
+                    missingLyrics.put(key, SystemClock.elapsedRealtime() + 300_000)
+                    lyricsWarning.value = "이 곡과 일치하는 가사를 찾지 못했어요."
+                } else {
+                    acceptLyrics(current, result)
+                    diskCache.write(current, result)
+                }
+            } catch (error: IOException) {
                 coroutineContext.ensureActive()
-                lyricsWarning.value = "가사 서버에 연결할 수 없어요. 인터넷 연결을 확인해 주세요."
-                return@launch
+                lyricsWarning.value = error.message?.takeIf { error is LyricsLookupException }
+                    ?: "가사 서버에 연결할 수 없어요. 새로고침으로 다시 시도해 주세요."
             } catch (_: JSONException) {
                 coroutineContext.ensureActive()
                 lyricsWarning.value = "가사 서버의 응답을 읽을 수 없어요."
-                return@launch
+            } finally {
+                val request = coroutineContext[kotlinx.coroutines.Job]
+                if (lookup == request) lookup = null
+                if (request?.isActive == true) updateLyrics()
             }
-            if (result == null) {
-                lyricsWarning.value = "이 곡과 일치하는 가사를 찾지 못했어요."
-                return@launch
-            }
-            cache.put(current, result)
-            lyrics = result
-            startTranslation(current, result)
         }
     }
 
-    private suspend fun searchSources(current: Song): Lyrics? {
-        val providers = buildList<(Song) -> Lyrics?> {
-            if (current.videoId != null) add(YouTubeMusicLyrics::find)
+    private fun acceptLyrics(current: Song, result: Lyrics) {
+        if (!SongMatcher.sameRecording(song, current)) return
+        val previous = lyrics
+        lyrics = result
+        cache.put(SongMatcher.recordingKey(current), result)
+        lyricsWarning.value = ""
+        if (previous == null || previous.plain != result.plain) {
+            resetTranslation()
+            startTranslation(current, result)
+        }
+        updateLyrics()
+    }
+
+    private suspend fun searchSources(current: Song, onPlain: (Lyrics) -> Unit): Lyrics? = coroutineScope {
+        val domestic = Regex("[가-힣]").containsMatchIn(current.title + current.artist)
+        val providers = buildList<suspend (Song) -> Lyrics?> {
             add(Lrclib::find)
-            add(BugsLyrics::find)
-            add(GenieLyrics::find)
-            add(LyricRadar::find)
+            if (current.videoId != null) add(YouTubeMusicLyrics::find)
+            if (domestic) {
+                add(BugsLyrics::find)
+                add(LyricRadar::find)
+                add(GenieLyrics::find)
+            } else {
+                add(LyricRadar::find)
+                add(BugsLyrics::find)
+                add(GenieLyrics::find)
+            }
         }
         val results = Channel<Pair<Int, Result<Lyrics?>>>(providers.size)
         val requests = providers.mapIndexed { priority, provider ->
-            scope.launch(Dispatchers.IO) {
+            launch(Dispatchers.Default) {
+                // Give fast sources a head start before opening more connections.
+                delay((priority / 2) * 450L)
                 val result = try {
                     Result.success(provider(current))
                 } catch (error: IOException) {
@@ -813,29 +979,33 @@ class LyricsOverlayService : AccessibilityService() {
         }
         var fallback: Lyrics? = null
         var fallbackPriority = Int.MAX_VALUE
-        var failure: Throwable? = null
+        var failed = 0
         var received = 0
-        return try {
+        try {
             val synced = withTimeoutOrNull(16_000L) {
                 repeat(providers.size) {
                     val (priority, result) = results.receive()
                     received++
-                    val candidate = result.getOrElse {
-                        failure = it
-                        null
-                    }
+                    val candidate = result.getOrElse { failed++; null }
                     if (candidate != null) {
                         if (candidate.lines.isNotEmpty()) return@withTimeoutOrNull candidate
                         if (priority < fallbackPriority) {
+                            val first = fallback == null
                             fallback = candidate
                             fallbackPriority = priority
+                            if (first) onPlain(candidate)
                         }
                     }
                 }
                 null
             }
-            synced ?: fallback ?: failure?.let { throw it }
-                ?: if (received < providers.size) throw java.net.SocketTimeoutException("Lyrics lookup timed out") else null
+            synced ?: fallback ?: when {
+                received < providers.size ->
+                    throw LyricsLookupException("가사 검색 시간이 초과됐어요. 새로고침으로 다시 시도해 주세요.")
+                failed > 0 ->
+                    throw LyricsLookupException("가사 검색 중 일부 출처에 연결하지 못했어요. 새로고침으로 다시 시도해 주세요.")
+                else -> null
+            }
         } finally {
             requests.forEach { it.cancel() }
             results.cancel()
@@ -853,6 +1023,7 @@ class LyricsOverlayService : AccessibilityService() {
     }
 
     private fun startTranslation(current: Song, loaded: Lyrics) {
+        translationJob?.cancel()
         fun updateFullLyrics() {
             val text = loaded.plain.lineSequence().joinToString("\n") { original ->
                 translations[original.trim()]?.let { "$original\n$it\n" } ?: original
@@ -860,11 +1031,11 @@ class LyricsOverlayService : AccessibilityService() {
             fullLyrics.value = "${current.title} · ${current.artist}\n\n$text"
         }
 
-        if (!settings.translationEnabled) {
+        if (!settings.translationEnabled || !lyricsVisible || overlay == null) {
             updateFullLyrics()
             return
         }
-        val saved = translatedSongs.get(current)
+        val saved = translatedSongs.get(SongMatcher.recordingKey(current))
         if (saved != null) {
             translations.putAll(saved)
             updateFullLyrics()
@@ -879,7 +1050,7 @@ class LyricsOverlayService : AccessibilityService() {
                 if (translations.isEmpty()) {
                     translationWarning.value = "한국어 번역 결과가 없어요. 원문 가사를 표시해요."
                 } else {
-                    translatedSongs.put(current, translations.toMap())
+                    translatedSongs.put(SongMatcher.recordingKey(current), translations.toMap())
                 }
                 translationStatus.value = ""
             } catch (error: CancellationException) {
@@ -904,15 +1075,35 @@ class LyricsOverlayService : AccessibilityService() {
                 android.util.Log.w("LyricsOverlay", "Translation unavailable", error)
             }
             updateFullLyrics()
+            updateLyrics()
         }
     }
 
-    private fun hideOverlay() {
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        ) {
+            cache.evictAll()
+            translatedSongs.evictAll()
+        }
+    }
+
+    private fun hideOverlay(preserveOpenState: Boolean = false) {
+        playbackObserver.stop()
+        handler.removeCallbacks(tick)
+        if (!preserveOpenState) {
+            lookup?.cancel()
+            translationJob?.cancel()
+            lyricsVisible = false
+        }
+        lyricsButton?.let { windowManager.removeViewImmediate(it) }
+        lyricsButton = null
+        popupButton?.let { windowManager.removeViewImmediate(it) }
+        popupButton = null
         val cover = coverWindow ?: return
         coverWindow = null
-        refreshButton = null
-        moveButton = null
-        popupButton = null
         popupMode = false
         overlay = null
         overlayLabel = null
@@ -922,36 +1113,12 @@ class LyricsOverlayService : AccessibilityService() {
         touchStarted = false
         manualScrollUntil = 0
         coverBounds = null
-        lyricsVisible = false
+        pendingTapOffset = null
         handler.removeCallbacks(tick)
-        if (lyrics == null) {
+        if (!preserveOpenState && lyrics == null) {
             lookup?.cancel()
             song = null
         }
         windowManager.removeViewImmediate(cover)
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

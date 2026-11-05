@@ -6,8 +6,6 @@ import android.os.SystemClock
 import android.util.AtomicFile
 import java.io.File
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
@@ -117,43 +115,29 @@ internal object KoreanTranslation {
         return batches
     }
 
-    private fun request(source: String, text: String): String {
+    private suspend fun request(source: String, text: String): String {
         if (SystemClock.elapsedRealtime() < blockedUntil) throw TranslationCooldownException()
-        // The extension uses Google's web endpoint. It can reject automated requests.
         val url = Uri.parse("https://translate.googleapis.com/translate_a/single").buildUpon()
             .appendQueryParameter("client", "gtx")
             .appendQueryParameter("sl", source)
             .appendQueryParameter("tl", "ko")
             .appendQueryParameter("dt", "t")
             .build()
-        val connection = URL(url.toString()).openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = 5000
-            connection.readTimeout = 7000
-            connection.doOutput = true
-            connection.setRequestProperty("User-Agent", "FloatingLyrics/1.0")
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
-            val body = ("q=" + URLEncoder.encode(text, "UTF-8")).toByteArray()
-            connection.setFixedLengthStreamingMode(body.size)
-            connection.outputStream.use { it.write(body) }
-            val status = connection.responseCode
-            if (status in 300..399 || status == 403 || status == 429) {
+        val response = try {
+            LyricsHttp.request(url.toString(), "q=" + URLEncoder.encode(text, "UTF-8"),
+                mapOf("Content-Type" to "application/x-www-form-urlencoded;charset=UTF-8"))
+        } catch (error: LyricsHttpException) {
+            if (error.status in 300..399 || error.status == 403 || error.status == 429) {
                 blockedUntil = SystemClock.elapsedRealtime() + COOLDOWN_MS
             }
-            if (status !in 200..299) throw TranslationHttpException(status)
-            val segments = connection.inputStream.bufferedReader(Charsets.UTF_8).use {
-                JSONArray(it.readText()).getJSONArray(0)
+            throw TranslationHttpException(error.status)
+        }
+        val segments = JSONArray(response).getJSONArray(0)
+        return buildString {
+            for (index in 0 until segments.length()) {
+                val part = segments.optJSONArray(index)?.opt(0) as? String
+                if (part != null) append(part)
             }
-            return buildString {
-                for (index in 0 until segments.length()) {
-                    val part = segments.optJSONArray(index)?.opt(0) as? String
-                    if (part != null) append(part)
-                }
-            }
-        } finally {
-            connection.disconnect()
         }
     }
 
