@@ -4,7 +4,7 @@ YouTube Music에서 재생 중인 곡의 가사를 보여주는 Android 앱입�
 
 ## 다운로드
 
-**[배포된 테스트 APK 다운로드 · v0.2.0-test](https://github.com/umtej2/Eom-Lyrics/releases/download/v0.2.0-test/Eom-Lyrics-v0.2.0-test.apk)** · Android 10 이상
+**[배포된 테스트 APK 다운로드 · v0.3.0-test](https://github.com/umtej2/Eom-Lyrics/releases/download/v0.3.0-test/Eom-Lyrics-v0.3.0-test.apk)** · Android 10 이상
 
 [전체 릴리스와 이전 버전](https://github.com/umtej2/Eom-Lyrics/releases)
 
@@ -29,9 +29,7 @@ YouTube Music에서 재생 중인 곡의 가사를 보여주는 Android 앱입�
 
 ## 패치 노트
 
-### 2026-11-26 · main 브랜치 업데이트
-
-아래 변경은 소스에 반영되었으며 위의 v0.2.0-test APK에는 포함되지 않습니다.
+### v0.3.0-test · 2026-11-26
 
 - 탐색 탭과 미니 플레이어를 구분하도록 표시 조건을 개선하고, 앨범 커버 안쪽 여백과 재생목록의 가사 표시 높이를 조정했습니다. 저장된 기준 위치에서 손잡이로 가사창을 이동할 수 있습니다.
 - 가사 플로팅은 재생 화면을 벗어나도 유지됩니다. 싱크 가사에 빈 줄로 표시된 간주에는 다음 줄의 시작 시각까지 ♪를 표시합니다.
