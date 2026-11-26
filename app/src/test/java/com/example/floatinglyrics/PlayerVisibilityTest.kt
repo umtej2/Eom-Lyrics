@@ -9,6 +9,10 @@ class PlayerVisibilityTest {
         assertFalse(PlayerLayoutDetector.matchesExpandedPlayer(false, false, false, false, 0))
     }
 
+    @Test fun browseTabsOverrideStalePlayerControls() {
+        assertFalse(PlayerLayoutDetector.matchesExpandedPlayer(true, true, true, true, 2, 3))
+    }
+
     @Test fun miniPlayerProgressAndNextButtonAreNotEnough() {
         assertFalse(PlayerLayoutDetector.matchesExpandedPlayer(true, false, true, false, 0))
         assertFalse(PlayerLayoutDetector.matchesExpandedPlayer(true, true, true, false, 0))

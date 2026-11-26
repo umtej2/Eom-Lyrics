@@ -29,9 +29,7 @@ internal object GenieLyrics {
                 val id = row.groupValues[1]
                 if (!seen.add(id)) continue
                 val lines = optional { timed(id) }.orEmpty()
-                if (lines.count { it.text.isNotBlank() } >= 2) {
-                    return Lyrics(lines, lines.map { it.text }.filter(String::isNotBlank).joinToString("\n"))
-                }
+                Lyrics.fromTimedLines(lines)?.let { return it }
                 if (fallback == null) {
                     val text = optional { plainText(id) }
                     if (!text.isNullOrBlank()) fallback = Lyrics(emptyList(), text)

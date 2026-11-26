@@ -43,7 +43,7 @@ internal object KoreanTranslation {
         }
     }
 
-    suspend fun translate(context: Context, lyrics: Lyrics, source: String): Map<String, String> =
+    suspend fun translate(context: Context, lyrics: Lyrics, source: String, recordingKey: String): Map<String, String> =
         withContext(Dispatchers.IO) {
             val lines = (lyrics.lines.map { it.text } + lyrics.plain.lines())
                 .map(String::trim)
@@ -53,7 +53,7 @@ internal object KoreanTranslation {
 
             val directory = File(context.cacheDir, "lyric-translations")
             val key = MessageDigest.getInstance("SHA-256")
-                .digest(("v1:$source\n" + lines.joinToString("\n")).toByteArray())
+                .digest(("v2:$recordingKey:$source\n" + lines.joinToString("\n")).toByteArray())
                 .joinToString("") { "%02x".format(it) }
             val file = File(directory, "$key.json")
             readCache(file)?.let { return@withContext it }

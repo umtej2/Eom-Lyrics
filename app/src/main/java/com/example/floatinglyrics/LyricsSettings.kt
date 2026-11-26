@@ -9,6 +9,7 @@ internal data class LyricsSettings(
     val darkness: Int = 72,
     val autoScroll: Boolean = true,
     val translationEnabled: Boolean = true,
+    val adjustCoverPosition: Boolean = false,
     val coverOffsetX: Int = 0,
     val coverOffsetY: Int = 0,
     val popupLines: Int = 2,
@@ -26,6 +27,7 @@ internal data class LyricsSettings(
             .putInt("darkness", darkness)
             .putBoolean("autoScroll", autoScroll)
             .putBoolean("translationEnabled", translationEnabled)
+            .putBoolean("adjustCoverPosition", adjustCoverPosition)
             .putInt("coverOffsetX", coverOffsetX)
             .putInt("coverOffsetY", coverOffsetY)
             .putInt("popupLines", popupLines)
@@ -48,6 +50,7 @@ internal data class LyricsSettings(
             darkness = preferences.getInt("darkness", 72),
             autoScroll = preferences.getBoolean("autoScroll", true),
             translationEnabled = preferences.getBoolean("translationEnabled", true),
+            adjustCoverPosition = preferences.getBoolean("adjustCoverPosition", false),
             coverOffsetX = preferences.getInt("coverOffsetX", 0),
             coverOffsetY = preferences.getInt("coverOffsetY", 0),
             popupLines = preferences.getInt("popupLines", 2),

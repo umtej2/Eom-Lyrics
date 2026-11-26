@@ -27,7 +27,7 @@ private val AppColors = darkColorScheme(
 @Composable
 internal fun LyricsAppScreen(
     settings: LyricsSettings,
-    title: String?, artist: String?, notificationAccess: Boolean, accessibilityAccess: Boolean,
+    notificationAccess: Boolean, accessibilityAccess: Boolean,
     onSettings: (LyricsSettings) -> Unit,
     openNotifications: () -> Unit, openAccessibility: () -> Unit
 ) {
@@ -35,7 +35,7 @@ internal fun LyricsAppScreen(
     MaterialTheme(colorScheme = AppColors) {
         Scaffold(
             bottomBar = {
-                NavigationBar(containerColor = Color(0xFF141414), tonalElevation = 0.dp) {
+                NavigationBar(containerColor = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                     val labels = listOf("홈", "설정", "앱 정보")
                     val icons = listOf(R.drawable.ic_app_home, R.drawable.ic_app_settings, R.drawable.ic_app_info)
                     labels.forEachIndexed { index, label ->
@@ -75,11 +75,7 @@ internal fun LyricsAppScreen(
                 }
                 when (tab) {
                     0 -> {
-                        Panel("지금 재생 중") {
-                            Text(title?.takeIf(String::isNotBlank) ?: "음악을 재생해 주세요",
-                                style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                            Caption(artist?.takeIf(String::isNotBlank) ?: "YouTube Music에서 재생한 곡이 여기에 표시돼요.")
-                            HorizontalDivider(color = Color(0xFF333333))
+                        Panel("가사창") {
                             Toggle("가사창 사용", "설정한 방식으로 가사를 열 수 있어요.", settings.enabled) {
                                 onSettings(settings.copy(enabled = it))
                             }
@@ -95,8 +91,8 @@ internal fun LyricsAppScreen(
                         Panel("이렇게 사용해 보세요") {
                             Text("가사 줄을 누르면 그 부분으로", fontWeight = FontWeight.SemiBold)
                             Caption("시간 정보가 있는 가사를 짧게 누르면 해당 구간으로 이동해요. 끌어서 스크롤할 수도 있어요.")
-                            Text("작은 팝업은 닫기 아이콘 위에", fontWeight = FontWeight.SemiBold)
-                            Caption("팝업 아이콘으로 작은 창을 열고, 끌어서 위치를 옮겨요. 일반 화면과 재생목록 화면을 전환해도 가사 켜짐 상태는 유지돼요.")
+                            Text("가사 플로팅 사용하기", fontWeight = FontWeight.SemiBold)
+                            Caption("닫기 버튼 위의 아이콘을 누르면 가사 플로팅이 열려요. 창을 끌어 위치를 옮길 수 있어요. 일반 화면과 재생목록 화면을 전환해도 가사 켜짐 상태는 유지돼요.")
                         }
                         val warning = LyricsOverlayService.lyricsWarning.value.ifBlank {
                             if (settings.translationEnabled) LyricsOverlayService.translationWarning.value else ""
@@ -106,9 +102,6 @@ internal fun LyricsAppScreen(
                         }
                         if (settings.translationEnabled && LyricsOverlayService.translationStatus.value.isNotBlank()) {
                             Caption(LyricsOverlayService.translationStatus.value)
-                        }
-                        ExpandablePanel("전체 가사", initiallyExpanded = false) {
-                            Text(LyricsOverlayService.fullLyrics.value.ifBlank { "가사를 불러오면 여기에 표시돼요." }, lineHeight = 28.sp)
                         }
                     }
                     1 -> {
@@ -137,23 +130,23 @@ internal fun LyricsAppScreen(
                                 onSettings(settings.copy(seekOnLyricTap = it))
                             }
                             Toggle("현재 가사 따라가기", "재생 중인 줄을 자동으로 보여줘요.", settings.autoScroll) { onSettings(settings.copy(autoScroll = it)) }
-                            Caption("저장한 고정 위치를 사용해요. 재생목록이 펼쳐지면 가사창의 위쪽 절반만 사용하고, 다시 내리면 원래 높이로 돌아와요. 터치 영역과 버튼도 함께 바뀌어요.")
+                            Caption("저장한 고정 위치를 사용해요. 재생목록이 펼쳐지면 저장한 위치에서 버튼이 일정 거리 위로 이동하고, 다시 내리면 원래 높이로 돌아와요. 터치 영역과 버튼도 함께 바뀌어요.")
                         }
                         ExpandablePanel("글자와 배경", initiallyExpanded = true) {
                             SettingSlider("글자 크기", "${settings.textSize} sp", settings.textSize, 12f..28f, 15) { onSettings(settings.copy(textSize = it)) }
                             SettingSlider("배경 어둡기", "${settings.darkness}%", settings.darkness, 25f..95f) { onSettings(settings.copy(darkness = it)) }
                         }
                         ExpandablePanel("가사창 위치") {
-                            SettingSlider("가로", "${settings.coverOffsetX} dp", settings.coverOffsetX, -150f..150f) { onSettings(settings.copy(coverOffsetX = it)) }
-                            SettingSlider("세로", "${settings.coverOffsetY} dp", settings.coverOffsetY, -200f..200f) { onSettings(settings.copy(coverOffsetY = it)) }
-                            Caption("화면 기준 기본 위치에서 조정해요. 왼쪽·위는 음수, 오른쪽·아래는 양수예요. 저장한 위치와 버튼 배치는 다음에도 유지돼요.")
+                            Toggle("위치 조절", "가사창 오른쪽 위의 이동 버튼을 누른 채 끌어 보세요. 손을 떼면 위치가 저장돼요.", settings.adjustCoverPosition) {
+                                onSettings(settings.copy(adjustCoverPosition = it))
+                            }
                             TextButton(onClick = { onSettings(settings.copy(coverOffsetX = 0, coverOffsetY = 0)) }) { Text("위치 초기화") }
                         }
-                        ExpandablePanel("작은 팝업") {
+                        ExpandablePanel("가사 플로팅") {
                             SettingSlider("표시 줄 수", "${settings.popupLines}줄", settings.popupLines, 1f..4f, 2) { onSettings(settings.copy(popupLines = it)) }
                             SettingSlider("글자 크기", "${settings.popupTextSize} sp", settings.popupTextSize, 12f..28f, 15) { onSettings(settings.copy(popupTextSize = it)) }
                             SettingSlider("배경 어둡기", "${settings.popupDarkness}%", settings.popupDarkness, 0f..95f) { onSettings(settings.copy(popupDarkness = it)) }
-                            TextButton(onClick = { onSettings(settings.copy(popupOffsetX = 0, popupOffsetY = 0)) }) { Text("팝업 위치 초기화") }
+                            TextButton(onClick = { onSettings(settings.copy(popupOffsetX = 0, popupOffsetY = 0)) }) { Text("가사 플로팅 위치 초기화") }
                         }
                         ExpandablePanel("번역") {
                             Toggle("한국어 번역 표시", "지원되는 외국어 가사 아래에 번역을 표시해요.", settings.translationEnabled) { onSettings(settings.copy(translationEnabled = it)) }
@@ -163,7 +156,7 @@ internal fun LyricsAppScreen(
                     else -> {
                         Panel("Eom Lyrics") {
                             Text("YouTube Music과 함께 쓰는 가사창", style = MaterialTheme.typography.titleMedium)
-                            Caption("앨범 커버 위 가사, 구간 이동, 작은 팝업과 한국어 번역을 제공해요. YouTube Music과 별도로 동작하는 앱이에요.")
+                            Caption("앨범 커버 위 가사, 구간 이동, 가사 플로팅과 한국어 번역을 제공해요. YouTube Music과 별도로 동작하는 앱이에요.")
                         }
                         Panel("출처와 크레딧") {
                             Text("가사", fontWeight = FontWeight.SemiBold)

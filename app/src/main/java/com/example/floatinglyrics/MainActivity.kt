@@ -6,53 +6,28 @@ import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 
 class PlaybackNotificationListener : NotificationListenerService()
 
 class MainActivity : ComponentActivity() {
     private val lyricsPreferences by lazy { LyricsSettings.preferences(this) }
     private var settings by mutableStateOf(LyricsSettings())
-    private var playback by mutableStateOf(PlaybackInfo())
+    private var notificationAccess by mutableStateOf(false)
     private var accessibilityAccess by mutableStateOf(false)
-    private val playbackObserver: PlaybackObserver by lazy {
-        PlaybackObserver(this) {
-            val current = playbackObserver.song
-            playback = PlaybackInfo(playbackObserver.hasAccess, current?.title, current?.artist)
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        val systemBars = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        enableEdgeToEdge(statusBarStyle = systemBars, navigationBarStyle = systemBars)
         settings = LyricsSettings.read(lyricsPreferences)
         setContent {
-            DisposableEffect(lifecycle) {
-                val listener = LifecycleEventObserver { _, event ->
-                    when (event) {
-                        Lifecycle.Event.ON_START -> playbackObserver.start()
-                        Lifecycle.Event.ON_STOP -> playbackObserver.stop()
-                        else -> Unit
-                    }
-                }
-                lifecycle.addObserver(listener)
-                if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) playbackObserver.start()
-                onDispose {
-                    lifecycle.removeObserver(listener)
-                    playbackObserver.stop()
-                }
-            }
             LyricsAppScreen(
                 settings = settings,
-                title = playback.title,
-                artist = playback.artist,
-                notificationAccess = playback.hasAccess,
+                notificationAccess = notificationAccess,
                 accessibilityAccess = accessibilityAccess,
                 onSettings = ::updateSettings,
                 openNotifications = {
@@ -67,6 +42,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        notificationAccess = getSystemService(android.app.NotificationManager::class.java)
+            .isNotificationListenerAccessGranted(android.content.ComponentName(this, PlaybackNotificationListener::class.java))
         settings = LyricsSettings.read(lyricsPreferences)
         val manager = getSystemService(android.view.accessibility.AccessibilityManager::class.java)
         accessibilityAccess = manager.getEnabledAccessibilityServiceList(
@@ -83,10 +60,4 @@ class MainActivity : ComponentActivity() {
         settings = value
         value.save(lyricsPreferences)
     }
-
-    private data class PlaybackInfo(
-        val hasAccess: Boolean = false,
-        val title: String? = null,
-        val artist: String? = null
-    )
 }

@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SongMatcherTest {
+    @Test fun separateVideosWithIdenticalMetadataNeverShareCachedLyrics() {
+        val song = Song("Track", "Artist", 120000)
+        val first = song.copy(videoId = "12345678901")
+        assertNotEquals(SongMatcher.recordingKey(song), SongMatcher.recordingKey(first))
+        assertNotEquals(SongMatcher.recordingKey(first), SongMatcher.recordingKey(song.copy(videoId = "12345678902")))
+        assertEquals(SongMatcher.recordingKey(first), SongMatcher.recordingKey(first.copy(durationMs = 0)))
+    }
+
     @Test fun featurePunctuationAndEnglishArtistNameDoNotHideDomesticLyrics() {
         val requested = SongMatcher.profile(Song("Red Wine (feat. Gist)", "unofficialboyy", 200000))
         assertNotNull(SongMatcher.match(requested, "Red Wine (Feat.Gist)", "unofficialboyy", 201000))

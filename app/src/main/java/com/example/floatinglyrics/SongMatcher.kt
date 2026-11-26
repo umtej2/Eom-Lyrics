@@ -113,7 +113,7 @@ internal object SongMatcher {
             recordingArtistKey(first.artist) == recordingArtistKey(second.artist)
     }
 
-    fun recordingKey(song: Song): String = listOf(
+    fun recordingKey(song: Song): String = song.videoId?.let { "video:$it" } ?: listOf(
         normalize(cleanTitle(song.title)), recordingArtistKey(song.artist), ((song.durationMs + 500) / 1000).toString()
     ).joinToString("|")
 

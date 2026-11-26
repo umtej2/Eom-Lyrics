@@ -2,7 +2,6 @@ package com.example.floatinglyrics
 
 import android.net.Uri
 import android.text.Html
-import java.io.IOException
 import org.json.JSONException
 import org.json.JSONObject
 
@@ -36,9 +35,7 @@ internal object BugsLyrics {
                         ?.takeIf { it.isFinite() && it >= 0 } ?: return@mapNotNull null
                     LyricLine((seconds * 1000).toLong(), line.substring(separator + 1).trim())
                 }.sortedBy { it.timeMs }
-                if (lines.count { it.text.isNotBlank() } >= 2) {
-                    return Lyrics(lines, lines.map { it.text }.filter(String::isNotBlank).joinToString("\n"))
-                }
+                Lyrics.fromTimedLines(lines)?.let { return it }
                 if (fallback == null) {
                     val plain = payload("N", id).trim()
                     if (plain.lineSequence().count(String::isNotBlank) >= 2) fallback = Lyrics(emptyList(), plain)

@@ -5,7 +5,16 @@ import org.json.JSONArray
 
 internal data class Song(val title: String, val artist: String, val durationMs: Long, val videoId: String? = null)
 internal data class LyricLine(val timeMs: Long, val text: String)
-internal data class Lyrics(val lines: List<LyricLine>, val plain: String)
+internal data class Lyrics(val lines: List<LyricLine>, val plain: String) {
+    companion object {
+        fun fromTimedLines(lines: List<LyricLine>): Lyrics? {
+            val textLines = lines.map { it.text }.filter(String::isNotBlank)
+            if (textLines.size < 2) return null
+            // Keep blank timed entries so the highlight can clear during instrumental breaks.
+            return Lyrics(lines, textLines.joinToString("\n"))
+        }
+    }
+}
 
 internal object Lrclib {
     private val timestamp = Regex("""\[(\d+):(\d{2})(?:[.:](\d{1,3}))?]""")

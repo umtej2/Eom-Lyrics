@@ -29,7 +29,8 @@ internal class LyricsDiskCache(context: Context) {
         try {
             val data = JSONObject(String(AtomicFile(file).readFully(), Charsets.UTF_8))
             val plain = data.getString("plain")
-            val source = Song(data.getString("title"), data.getString("artist"), data.getLong("duration"))
+            val source = Song(data.getString("title"), data.getString("artist"), data.getLong("duration"),
+                data.optString("videoId").takeIf(String::isNotBlank))
             if (plain.isBlank() || !SongMatcher.sameRecording(song, source)) return@withContext null
             val rows = data.getJSONArray("lines")
             val lines = (0 until rows.length()).map { index ->
@@ -49,7 +50,7 @@ internal class LyricsDiskCache(context: Context) {
         val rows = JSONArray()
         lyrics.lines.forEach { rows.put(JSONObject().put("time", it.timeMs).put("text", it.text)) }
         val data = JSONObject().put("title", song.title).put("artist", song.artist)
-            .put("duration", song.durationMs).put("plain", lyrics.plain).put("lines", rows)
+            .put("videoId", song.videoId).put("duration", song.durationMs).put("plain", lyrics.plain).put("lines", rows)
             .toString().toByteArray(Charsets.UTF_8)
         if (data.size > 500_000) return@withContext
         directory.mkdirs()
